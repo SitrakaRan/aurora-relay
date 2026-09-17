@@ -337,11 +337,15 @@ app.post("/api/chat/upload", (req, res) => {
       ? "video/mp4"
       : "image/jpeg");
 
-  uploadStore.set(id, {
+  const fileRecord = {
     data: payloadData,
     filename: filename || `fichier_${id}`,
     mimeType: detectedMime,
-  });
+  };
+  uploadStore.set(id, fileRecord);
+  if (filename) {
+    uploadStore.set(filename, fileRecord);
+  }
 
   res.json({ success: true, url: `/api/chat/uploads/${id}`, id });
 });
@@ -357,23 +361,36 @@ app.get("/api/chat/uploads/:id", (req, res) => {
   res.send(Buffer.from(file.data, "base64"));
 });
 
+app.get("/chat-uploads/:filename", (req, res) => {
+  const file = uploadStore.get(req.params.filename);
+  if (!file) return res.status(404).send("Fichier introuvable");
+  res.setHeader("Content-Type", file.mimeType);
+  if (file.data.startsWith("data:")) {
+    const base64Data = file.data.split(",")[1];
+    return res.send(Buffer.from(base64Data, "base64"));
+  }
+  res.send(Buffer.from(file.data, "base64"));
+});
+
 // Tout autre chemin renvoie 404
 app.use((_req, res) => res.status(404).send("Not Found"));
 
 const server = http.createServer(app);
 
 // 2. Serveurs Socket.IO : supporte à la fois le chemin standard (/socket.io) et /call
-// pour garantir une compatibilité universelle avec toutes les versions de l'application.
+// avec maxHttpBufferSize à 50 Mo pour autoriser photos et notes vocales sans déconnexion.
 const io = new Server(server, {
   cors: { origin: "*" },
   path: "/socket.io",
   transports: ["polling", "websocket"],
+  maxHttpBufferSize: 5e7,
 });
 
 const ioCall = new Server(server, {
   cors: { origin: "*" },
   path: "/call",
   transports: ["polling", "websocket"],
+  maxHttpBufferSize: 5e7,
 });
 
 const onlineUsers = new Map(); // socketId -> { userId, userName, role, avatarUrl }
