@@ -525,6 +525,29 @@ function broadcastAll(event, data) {
   } catch {}
 }
 
+// Fonction universelle d'émission vers tous les clients sauf l'émetteur (sans doublon ni écho)
+function relayToOthers(senderSocket, event, data) {
+  const payload = { ...data, fromSid: senderSocket.id };
+  const targetInstances = [
+    io,
+    io.of("/call"),
+    ioCall,
+    ioCall.of("/call"),
+  ];
+  const deliveredSids = new Set([senderSocket.id]);
+
+  for (const inst of targetInstances) {
+    try {
+      for (const [sid, s] of inst.sockets) {
+        if (!deliveredSids.has(sid)) {
+          deliveredSids.add(sid);
+          s.emit(event, payload);
+        }
+      }
+    } catch {}
+  }
+}
+
 // Fonction de calcul et diffusion de la présence en temps réel
 function broadcastPresence() {
   const users = Array.from(onlineUsers.values());
@@ -679,39 +702,18 @@ function registerSocketHandlers(socket) {
     broadcastAll("chat:reaction", evt);
   });
 
-  // Signalisation d'appels / interphone WebRTC de secours
-  socket.on("offer", (data) => {
-    socket.broadcast.emit("offer", { ...data, fromSid: socket.id });
-    try { io.of("/call").except(socket.id).emit("offer", { ...data, fromSid: socket.id }); } catch {}
-    try { ioCall.except(socket.id).emit("offer", { ...data, fromSid: socket.id }); } catch {}
-    try { ioCall.of("/call").except(socket.id).emit("offer", { ...data, fromSid: socket.id }); } catch {}
-  });
-
-  socket.on("answer", (data) => {
-    socket.broadcast.emit("answer", { ...data, fromSid: socket.id });
-    try { io.of("/call").except(socket.id).emit("answer", { ...data, fromSid: socket.id }); } catch {}
-    try { ioCall.except(socket.id).emit("answer", { ...data, fromSid: socket.id }); } catch {}
-    try { ioCall.of("/call").except(socket.id).emit("answer", { ...data, fromSid: socket.id }); } catch {}
-  });
-
-  socket.on("ice", (data) => {
-    socket.broadcast.emit("ice", { ...data, fromSid: socket.id });
-    try { io.of("/call").except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
-    try { ioCall.except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
-    try { ioCall.of("/call").except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
-  });
-
+  // Signalisation d'appels / interphone WebRTC de secours (sans duplication ni écho)
+  socket.on("offer", (data) => relayToOthers(socket, "offer", data));
+  socket.on("answer", (data) => relayToOthers(socket, "answer", data));
+  socket.on("ice", (data) => relayToOthers(socket, "ice", data));
   socket.on("ice-candidate", (data) => {
-    socket.broadcast.emit("ice-candidate", { ...data, fromSid: socket.id });
-    socket.broadcast.emit("ice", { ...data, fromSid: socket.id });
-    try { io.of("/call").except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
-    try { ioCall.except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
-    try { ioCall.of("/call").except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
+    relayToOthers(socket, "ice", data);
+    relayToOthers(socket, "ice-candidate", data);
   });
 
-  socket.on("call-taken", (data) => broadcastAll("call-taken", data));
-  socket.on("busy", (data) => broadcastAll("busy", data));
-  socket.on("hangup", (data) => broadcastAll("hangup", data));
+  socket.on("call-taken", (data) => relayToOthers(socket, "call-taken", data));
+  socket.on("busy", (data) => relayToOthers(socket, "busy", data));
+  socket.on("hangup", (data) => relayToOthers(socket, "hangup", data));
 
   socket.on("disconnect", () => {
     const user = onlineUsers.get(socket.id);
