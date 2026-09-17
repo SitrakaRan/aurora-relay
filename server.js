@@ -214,8 +214,15 @@ app.post("/api/chat/messages", (req, res) => {
   }
   msg.status = "sent";
 
+  const list = messageStore.get(msg.threadId) || [];
+  const isDuplicate = list.some((m) => m.id === msg.id);
+
   saveMessage(msg);
-  broadcastAll("chat:message", msg);
+
+  if (!isDuplicate) {
+    broadcastAll("chat:message", msg);
+  }
+
   res.json({ success: true, message: msg });
 });
 
