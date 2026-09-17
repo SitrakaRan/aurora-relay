@@ -2,7 +2,7 @@ const http = require("http");
 const express = require("express");
 const { Server } = require("socket.io");
 
-const PORT = Number(process.env.PORT || 10000);
+const PORT = Number(process.env.PORT || 8000);
 const app = express();
 
 // CORS permissif pour toutes les requêtes directes et mobiles
