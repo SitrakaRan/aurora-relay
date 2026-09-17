@@ -5,6 +5,7 @@ const { Server } = require("socket.io");
 const PORT = Number(process.env.PORT || 10000);
 const app = express();
 
+// CORS permissif pour toutes les requêtes directes et mobiles
 app.use((_req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
@@ -14,49 +15,334 @@ app.use((_req, res, next) => {
 });
 app.use(express.json({ limit: "50mb" }));
 
-// 1. Protection : AUCUN site web, AUCUN dashboard affiché
-// Si un visiteur ouvre l'adresse dans un navigateur, il reçoit un 404 neutre
+// 1. Protection : AUCUN site web, AUCUN dashboard public affiché
 app.get("/", (_req, res) => {
   res.status(404).send("Not Found");
 });
 
 // Endpoint de santé pour le maintien en éveil (cron-job.org / UptimeRobot)
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "aurora-messenger-relay", timestamp: Date.now() });
+  res.json({
+    ok: true,
+    service: "aurora-messenger-relay",
+    timestamp: Date.now(),
+    onlineUsersCount: onlineUsers.size,
+  });
 });
 
-// Mémoire tampon circulaire des derniers messages en cas de coupure (jusqu'à 300 messages)
+// Mémoire tampon circulaire des derniers messages en cas de coupure (jusqu'à 500 messages par thread)
 const messageStore = new Map(); // threadId -> Array<Message>
 const uploadStore = new Map();  // fileId -> { data, mime, name }
+const threadStore = new Map();  // threadId -> Thread
+
+// Utilisateurs pré-configurés et dynamiquement découverts
+const registeredUsers = new Map([
+  ["user-admin-01", { id: "user-admin-01", name: "Administrateur", role: "admin", avatarColor: "#fbbf24" }],
+  ["user-family-02", { id: "user-family-02", name: "Famille", role: "family", avatarColor: "#34d399" }],
+  ["user-guest-03", { id: "user-guest-03", name: "Invité", role: "guest", avatarColor: "#fbbf24" }],
+  ["user-1788377270406-i26g", { id: "user-1788377270406-i26g", name: "Nadia", role: "family", avatarColor: "#fbbf24" }],
+]);
+
+// Fil général par défaut
+threadStore.set("family-general", {
+  id: "family-general",
+  type: "group",
+  name: "Famille",
+  participants: ["Tous"],
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: new Date().toISOString(),
+  unreadCount: 0,
+  quickEmoji: "👍",
+  chatTheme: "ocean",
+});
 
 function saveMessage(msg) {
   if (!msg || !msg.threadId) return;
   const list = messageStore.get(msg.threadId) || [];
-  list.push(msg);
-  if (list.length > 300) list.shift();
+  // Éviter les doublons
+  const existingIdx = list.findIndex((m) => m.id === msg.id);
+  if (existingIdx >= 0) {
+    list[existingIdx] = { ...list[existingIdx], ...msg };
+  } else {
+    list.push(msg);
+    if (list.length > 500) list.shift();
+  }
   messageStore.set(msg.threadId, list);
+
+  // Mettre à jour le dernier message du thread
+  const thread = threadStore.get(msg.threadId) || {
+    id: msg.threadId,
+    type: "direct",
+    name: msg.senderName || "Conversation",
+    participants: [msg.senderId],
+    createdAt: new Date().toISOString(),
+  };
+  thread.lastMessage = msg;
+  thread.updatedAt = msg.timestamp || new Date().toISOString();
+  threadStore.set(msg.threadId, thread);
 }
 
-// Routes REST de secours pour le chat
+// ── Routes REST de secours pour le chat ──
+
+// Récupération des contacts et de leur présence réelle en direct
+app.get("/api/chat/contacts", (_req, res) => {
+  const onlineList = Array.from(onlineUsers.values());
+  const onlineUserIds = new Set(onlineList.map((u) => String(u.userId).toLowerCase().trim()));
+  const onlineUserNames = new Set(onlineList.map((u) => String(u.userName).toLowerCase().trim()));
+
+  const contacts = Array.from(registeredUsers.values()).map((u) => {
+    const isOnline =
+      onlineUserIds.has(String(u.id).toLowerCase().trim()) ||
+      onlineUserNames.has(String(u.name).toLowerCase().trim());
+    return {
+      id: u.id,
+      name: u.name,
+      role: u.role || "family",
+      avatarColor: u.avatarColor || "#3b82f6",
+      avatarUrl: u.avatarUrl || "",
+      online: isOnline,
+    };
+  });
+
+  // Ajouter les utilisateurs connectés non encore listés
+  for (const connected of onlineList) {
+    if (
+      connected.userId &&
+      !contacts.some(
+        (c) =>
+          c.id.toLowerCase() === connected.userId.toLowerCase() ||
+          c.name.toLowerCase() === connected.userName.toLowerCase()
+      )
+    ) {
+      contacts.push({
+        id: connected.userId,
+        name: connected.userName,
+        role: connected.role || "family",
+        avatarColor: "#3b82f6",
+        avatarUrl: connected.avatarUrl || "",
+        online: true,
+      });
+    }
+  }
+
+  res.json({ contacts });
+});
+
+// Récupération des conversations (threads)
+app.get("/api/chat/threads", (req, res) => {
+  const reqUserId = String(req.query.userId || "").toLowerCase().trim();
+  const reqUserName = String(req.query.userName || "").toLowerCase().trim();
+
+  let threads = Array.from(threadStore.values());
+  if (reqUserId || reqUserName) {
+    threads = threads.filter((t) => {
+      if (t.type === "group" || t.id === "family-general") return true;
+      if (!t.participants || t.participants.length === 0) return true;
+      return t.participants.some((p) => {
+        const pl = String(p).toLowerCase().trim();
+        return pl === reqUserId || pl === reqUserName;
+      });
+    });
+  }
+
+  res.json({ threads });
+});
+
+// Création / mise à jour de thread
+app.post("/api/chat/threads", (req, res) => {
+  const payload = req.body || {};
+  const id = payload.id || `thread-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const thread = {
+    ...payload,
+    id,
+    createdAt: payload.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  threadStore.set(id, thread);
+  broadcastAll("chat:thread-new", thread);
+  res.json({ success: true, thread });
+});
+
+app.put("/api/chat/threads/:id", (req, res) => {
+  const id = req.params.id;
+  const updates = req.body || {};
+  const existing = threadStore.get(id) || { id, createdAt: new Date().toISOString() };
+  const updated = { ...existing, ...updates, updatedAt: new Date().toISOString() };
+  threadStore.set(id, updated);
+  broadcastAll("chat:thread-update", updated);
+  res.json({ success: true, thread: updated });
+});
+
+app.delete("/api/chat/threads/:id", (req, res) => {
+  const id = req.params.id;
+  threadStore.delete(id);
+  messageStore.delete(id);
+  broadcastAll("chat:thread-deleted", { threadId: id });
+  res.json({ success: true });
+});
+
+// Messages d'un fil de discussion
 app.get("/api/chat/threads/:id/messages", (req, res) => {
   const list = messageStore.get(req.params.id) || [];
   res.json({ success: true, messages: list });
 });
 
+// Effacer les messages d'un fil
+app.delete("/api/chat/threads/:id/messages", (req, res) => {
+  const id = req.params.id;
+  messageStore.set(id, []);
+  broadcastAll("chat:thread-cleared", { threadId: id });
+  res.json({ success: true });
+});
+
+// Envoi d'un message (génère un ID si non fourni pour accepter tout type d'émetteur)
 app.post("/api/chat/messages", (req, res) => {
   const msg = req.body;
-  if (!msg || !msg.id) return res.status(400).json({ error: "Message invalide" });
+  if (!msg || !msg.threadId) {
+    return res.status(400).json({ error: "Message invalide : threadId requis" });
+  }
+
+  // Garantir un ID unique et un timestamp
+  if (!msg.id) {
+    msg.id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  }
+  if (!msg.timestamp) {
+    msg.timestamp = new Date().toISOString();
+  }
+  if (!msg.reactions) {
+    msg.reactions = [];
+  }
+  msg.status = "sent";
+
   saveMessage(msg);
-  io.emit("chat:message", msg);
+  broadcastAll("chat:message", msg);
   res.json({ success: true, message: msg });
 });
 
-// Upload léger de photos / notes vocales en secours
+// Réactions emojis sur un message
+app.post("/api/chat/messages/:id/react", (req, res) => {
+  const messageId = req.params.id;
+  const { emoji, userId, userName } = req.body || {};
+  if (!emoji || !userId) return res.status(400).json({ error: "Données de réaction manquantes" });
+
+  let foundMsg = null;
+  for (const list of messageStore.values()) {
+    const m = list.find((item) => item.id === messageId);
+    if (m) {
+      foundMsg = m;
+      break;
+    }
+  }
+
+  if (!foundMsg) {
+    return res.status(404).json({ error: "Message non trouvé" });
+  }
+
+  if (!Array.isArray(foundMsg.reactions)) {
+    foundMsg.reactions = [];
+  }
+
+  const existingIdx = foundMsg.reactions.findIndex(
+    (r) => r.userId === userId && r.emoji === emoji
+  );
+  if (existingIdx >= 0) {
+    foundMsg.reactions.splice(existingIdx, 1);
+  } else {
+    foundMsg.reactions.push({ emoji, userId, userName: userName || "Proche" });
+  }
+
+  broadcastAll("chat:reaction", {
+    messageId,
+    reactions: foundMsg.reactions,
+    threadId: foundMsg.threadId,
+  });
+
+  res.json({ success: true, reactions: foundMsg.reactions });
+});
+
+// Modification de message (edit)
+app.put("/api/chat/messages/:id", (req, res) => {
+  const messageId = req.params.id;
+  const { text } = req.body || {};
+  if (typeof text !== "string") return res.status(400).json({ error: "Texte requis" });
+
+  let foundMsg = null;
+  for (const list of messageStore.values()) {
+    const m = list.find((item) => item.id === messageId);
+    if (m) {
+      foundMsg = m;
+      break;
+    }
+  }
+
+  if (!foundMsg) {
+    return res.status(404).json({ error: "Message non trouvé" });
+  }
+
+  foundMsg.text = text;
+  foundMsg.edited = true;
+  foundMsg.editedAt = new Date().toISOString();
+
+  broadcastAll("chat:message-updated", foundMsg);
+  res.json({ success: true, message: foundMsg });
+});
+
+// Suppression de message
+app.delete("/api/chat/messages/:id", (req, res) => {
+  const messageId = req.params.id;
+  let deleted = false;
+  let threadId = "";
+
+  for (const [tId, list] of messageStore.entries()) {
+    const idx = list.findIndex((m) => m.id === messageId);
+    if (idx >= 0) {
+      list.splice(idx, 1);
+      deleted = true;
+      threadId = tId;
+      break;
+    }
+  }
+
+  if (deleted) {
+    broadcastAll("chat:message-deleted", { messageId, threadId });
+  }
+  res.json({ success: true });
+});
+
+// Accusés de lecture et réception
+app.post("/api/chat/threads/:id/read", (req, res) => {
+  const { userId } = req.body || {};
+  broadcastAll("chat:read", { threadId: req.params.id, userId });
+  res.json({ success: true });
+});
+
+app.post("/api/chat/threads/:id/delivered", (req, res) => {
+  const { userId } = req.body || {};
+  broadcastAll("chat:delivered", { threadId: req.params.id, userId });
+  res.json({ success: true });
+});
+
+// Upload de photos / notes vocales en secours
 app.post("/api/chat/upload", (req, res) => {
-  const { data, filename, mimeType } = req.body || {};
-  if (!data) return res.status(400).json({ error: "Aucun fichier reçu" });
+  const { data, base64, filename, mimeType, type } = req.body || {};
+  const payloadData = data || base64;
+  if (!payloadData) return res.status(400).json({ error: "Aucun fichier reçu" });
+
   const id = "up_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8);
-  uploadStore.set(id, { data, filename: filename || "fichier", mimeType: mimeType || "application/octet-stream" });
+  const detectedMime =
+    mimeType ||
+    (type === "audio"
+      ? "audio/webm"
+      : type === "video"
+      ? "video/mp4"
+      : "image/jpeg");
+
+  uploadStore.set(id, {
+    data: payloadData,
+    filename: filename || `fichier_${id}`,
+    mimeType: detectedMime,
+  });
+
   res.json({ success: true, url: `/api/chat/uploads/${id}`, id });
 });
 
@@ -76,34 +362,106 @@ app.use((_req, res) => res.status(404).send("Not Found"));
 
 const server = http.createServer(app);
 
-// 2. Serveur Socket.IO pour le temps réel et l'interphone d'urgence
+// 2. Serveurs Socket.IO : supporte à la fois le chemin standard (/socket.io) et /call
+// pour garantir une compatibilité universelle avec toutes les versions de l'application.
 const io = new Server(server, {
   cors: { origin: "*" },
-  path: "/call", // Compatible avec chatClient.ts et callClient.ts
+  path: "/socket.io",
   transports: ["polling", "websocket"],
 });
 
-const onlineUsers = new Map(); // socketId -> { userId, userName }
+const ioCall = new Server(server, {
+  cors: { origin: "*" },
+  path: "/call",
+  transports: ["polling", "websocket"],
+});
 
-io.on("connection", (socket) => {
-  // Identification utilisateur
+const onlineUsers = new Map(); // socketId -> { userId, userName, role, avatarUrl }
+
+// Fonction universelle d'émission vers tous les clients connectés
+function broadcastAll(event, data) {
+  try {
+    io.emit(event, data);
+    io.of("/call").emit(event, data);
+  } catch {}
+  try {
+    ioCall.emit(event, data);
+    ioCall.of("/call").emit(event, data);
+  } catch {}
+}
+
+// Fonction de calcul et diffusion de la présence en temps réel
+function broadcastPresence() {
+  const users = Array.from(onlineUsers.values());
+  const onlineUserIds = Array.from(new Set(users.map((u) => u.userId).filter(Boolean)));
+  const onlineUserNames = Array.from(new Set(users.map((u) => u.userName).filter(Boolean)));
+
+  const presencePayload = {
+    onlineUserIds,
+    onlineUserNames,
+    onlineUsers: users,
+  };
+
+  broadcastAll("chat:presence", presencePayload);
+}
+
+function registerSocketHandlers(socket) {
+  // Envoyer immédiatement l'état actuel de présence dès la connexion
+  const currentUsers = Array.from(onlineUsers.values());
+  socket.emit("chat:presence", {
+    onlineUserIds: Array.from(new Set(currentUsers.map((u) => u.userId).filter(Boolean))),
+    onlineUserNames: Array.from(new Set(currentUsers.map((u) => u.userName).filter(Boolean))),
+    onlineUsers: currentUsers,
+  });
+
+  // Identification utilisateur (compatible avec objet user ou data string)
   socket.on("chat:identify", (user) => {
-    if (!user || !user.userId) return;
-    onlineUsers.set(socket.id, { userId: user.userId, userName: user.userName || "Proche" });
-    io.emit("chat:presence", {
-      userId: user.userId,
-      status: "online",
-      onlineUsers: Array.from(onlineUsers.values()),
+    if (!user) return;
+    const userId = user.userId || user.id;
+    const userName = user.userName || user.name || "Proche";
+    if (!userId) return;
+
+    onlineUsers.set(socket.id, {
+      userId,
+      userName,
+      role: user.role || "family",
+      avatarUrl: user.avatarUrl || "",
     });
+
+    registeredUsers.set(userId, {
+      id: userId,
+      name: userName,
+      role: user.role || "family",
+      avatarUrl: user.avatarUrl || "",
+    });
+
+    broadcastPresence();
+  });
+
+  // Événement join (visio / interphone / identifiant utilisateur)
+  socket.on("join", (data) => {
+    if (data?.userId) {
+      onlineUsers.set(socket.id, {
+        userId: data.userId,
+        userName: data.name || "Appareil",
+        role: data.role || "kiosk",
+      });
+      broadcastPresence();
+    }
+    socket.broadcast.emit("peer-joined", { sid: socket.id, ...data });
   });
 
   // Relais des messages instantanés
   socket.on("chat:message", (msg) => {
-    saveMessage(msg);
+    if (msg) {
+      if (!msg.id) msg.id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      if (!msg.timestamp) msg.timestamp = new Date().toISOString();
+      saveMessage(msg);
+    }
     socket.broadcast.emit("chat:message", msg);
   });
 
-  // Relais de la saisie en cours (typing indicator)
+  // Relais de la saisie en cours
   socket.on("chat:typing", (evt) => {
     socket.broadcast.emit("chat:typing", evt);
   });
@@ -121,13 +479,12 @@ io.on("connection", (socket) => {
     socket.broadcast.emit("chat:delivered", evt);
   });
 
-  // Relais des réactions (emojis)
+  // Relais des réactions
   socket.on("chat:reaction", (evt) => {
     socket.broadcast.emit("chat:reaction", evt);
   });
 
   // Signalisation d'appels / interphone WebRTC de secours
-  socket.on("join", (data) => socket.broadcast.emit("peer-joined", { sid: socket.id, ...data }));
   socket.on("offer", (data) => socket.broadcast.emit("offer", data));
   socket.on("answer", (data) => socket.broadcast.emit("answer", data));
   socket.on("ice-candidate", (data) => socket.broadcast.emit("ice-candidate", data));
@@ -137,14 +494,17 @@ io.on("connection", (socket) => {
     const user = onlineUsers.get(socket.id);
     onlineUsers.delete(socket.id);
     if (user) {
-      io.emit("chat:presence", {
-        userId: user.userId,
-        status: "offline",
-        onlineUsers: Array.from(onlineUsers.values()),
-      });
+      broadcastPresence();
     }
   });
-});
+}
+
+// Enregistrement des écouteurs sur tous les namespaces (racine et /call)
+io.on("connection", registerSocketHandlers);
+io.of("/call").on("connection", registerSocketHandlers);
+
+ioCall.on("connection", registerSocketHandlers);
+ioCall.of("/call").on("connection", registerSocketHandlers);
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`[aurora-relay] Passerelle Messenger de secours écoute sur le port ${PORT}`);
