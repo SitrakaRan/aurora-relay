@@ -25,6 +25,7 @@ app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     service: "aurora-messenger-relay",
+    version: "2.1-reactions-read-sync",
     timestamp: Date.now(),
     onlineUsersCount: onlineUsers.size,
   });
@@ -148,9 +149,84 @@ app.get("/api/chat/threads", (req, res) => {
   res.json({ threads });
 });
 
-// Création / mise à jour de thread
+// Synchronisation complète depuis le serveur local Aurora
+app.post("/api/chat/sync", (req, res) => {
+  const { threads, messages, users } = req.body || {};
+  let syncedThreads = 0;
+  let syncedMessages = 0;
+
+  if (Array.isArray(threads)) {
+    threads.forEach((t) => {
+      if (t && t.id) {
+        const existing = threadStore.get(t.id);
+        threadStore.set(t.id, { ...existing, ...t });
+        syncedThreads++;
+      }
+    });
+  }
+
+  if (Array.isArray(messages)) {
+    messages.forEach((m) => {
+      if (m && m.id && m.threadId) {
+        saveMessage(m);
+        syncedMessages++;
+      }
+    });
+  }
+
+  if (Array.isArray(users)) {
+    users.forEach((u) => {
+      if (u && u.id) {
+        registeredUsers.set(u.id, {
+          id: u.id,
+          name: u.name || "Utilisateur",
+          role: u.role || "family",
+          avatarUrl: u.avatarUrl || "",
+        });
+      }
+    });
+  }
+
+  res.json({ success: true, syncedThreads, syncedMessages });
+});
+
+// Création / mise à jour de thread avec détection stricte des conversations directes existantes
 app.post("/api/chat/threads", (req, res) => {
   const payload = req.body || {};
+  const { type, creatorId, creatorName, targetUserId, targetUserName, name, participants } = payload;
+
+  if (type === "direct") {
+    const userA_keys = new Set();
+    if (creatorId) userA_keys.add(String(creatorId).toLowerCase().trim());
+    if (creatorName) userA_keys.add(String(creatorName).toLowerCase().trim());
+
+    const userB_keys = new Set();
+    if (targetUserId) userB_keys.add(String(targetUserId).toLowerCase().trim());
+    if (targetUserName) userB_keys.add(String(targetUserName).toLowerCase().trim());
+    if (name) userB_keys.add(String(name).toLowerCase().trim());
+
+    if (Array.isArray(participants) && participants.length >= 2) {
+      if (participants[0]) userA_keys.add(String(participants[0]).toLowerCase().trim());
+      if (participants[2]) userA_keys.add(String(participants[2]).toLowerCase().trim());
+      if (participants[1]) userB_keys.add(String(participants[1]).toLowerCase().trim());
+      if (participants[3]) userB_keys.add(String(participants[3]).toLowerCase().trim());
+    }
+
+    userA_keys.delete("");
+    userB_keys.delete("");
+
+    // Vérifier si un fil direct existe déjà pour ces deux correspondants
+    for (const t of threadStore.values()) {
+      if (t.type !== "direct" || t.id === "direct-aurora") continue;
+      const tParts = (t.participants || []).map((p) => String(p).toLowerCase().trim());
+      const hasA = Array.from(userA_keys).some((k) => tParts.includes(k));
+      const hasB = Array.from(userB_keys).some((k) => tParts.includes(k));
+      if (hasA && hasB) {
+        return res.json({ success: true, thread: t });
+      }
+    }
+  }
+
   const id = payload.id || `thread-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const thread = {
     ...payload,
@@ -229,7 +305,7 @@ app.post("/api/chat/messages", (req, res) => {
 // Réactions emojis sur un message
 app.post("/api/chat/messages/:id/react", (req, res) => {
   const messageId = req.params.id;
-  const { emoji, userId, userName } = req.body || {};
+  const { emoji, userId, userName, threadId: reqThreadId } = req.body || {};
   if (!emoji || !userId) return res.status(400).json({ error: "Données de réaction manquantes" });
 
   let foundMsg = null;
@@ -241,27 +317,38 @@ app.post("/api/chat/messages/:id/react", (req, res) => {
     }
   }
 
+  const threadId = reqThreadId || foundMsg?.threadId || "family-general";
+
   if (!foundMsg) {
-    return res.status(404).json({ error: "Message non trouvé" });
-  }
-
-  if (!Array.isArray(foundMsg.reactions)) {
-    foundMsg.reactions = [];
-  }
-
-  const existingIdx = foundMsg.reactions.findIndex(
-    (r) => r.userId === userId && r.emoji === emoji
-  );
-  if (existingIdx >= 0) {
-    foundMsg.reactions.splice(existingIdx, 1);
+    // Si le message n'est pas encore en mémoire dans le relais (ex: redémarrage instance ou message créé avant bascule),
+    // on ne renvoie pas 404 : on initialise la réaction et on la diffuse en direct !
+    foundMsg = {
+      id: messageId,
+      threadId,
+      reactions: [{ emoji, userId, userName: userName || "Proche" }],
+      timestamp: new Date().toISOString(),
+      status: "sent",
+    };
+    saveMessage(foundMsg);
   } else {
-    foundMsg.reactions.push({ emoji, userId, userName: userName || "Proche" });
+    if (!Array.isArray(foundMsg.reactions)) {
+      foundMsg.reactions = [];
+    }
+
+    const existingIdx = foundMsg.reactions.findIndex(
+      (r) => r.userId === userId && r.emoji === emoji
+    );
+    if (existingIdx >= 0) {
+      foundMsg.reactions.splice(existingIdx, 1);
+    } else {
+      foundMsg.reactions.push({ emoji, userId, userName: userName || "Proche" });
+    }
   }
 
   broadcastAll("chat:reaction", {
     messageId,
     reactions: foundMsg.reactions,
-    threadId: foundMsg.threadId,
+    threadId: foundMsg.threadId || threadId,
   });
 
   res.json({ success: true, reactions: foundMsg.reactions });
@@ -318,14 +405,37 @@ app.delete("/api/chat/messages/:id", (req, res) => {
 
 // Accusés de lecture et réception
 app.post("/api/chat/threads/:id/read", (req, res) => {
+  const threadId = req.params.id;
   const { userId } = req.body || {};
-  broadcastAll("chat:read", { threadId: req.params.id, userId });
+
+  const list = messageStore.get(threadId) || [];
+  list.forEach((m) => {
+    if (m.senderId !== userId) {
+      m.status = "read";
+    }
+  });
+
+  const thread = threadStore.get(threadId);
+  if (thread) {
+    thread.unreadCount = 0;
+  }
+
+  broadcastAll("chat:read", { threadId, userId });
   res.json({ success: true });
 });
 
 app.post("/api/chat/threads/:id/delivered", (req, res) => {
+  const threadId = req.params.id;
   const { userId } = req.body || {};
-  broadcastAll("chat:delivered", { threadId: req.params.id, userId });
+
+  const list = messageStore.get(threadId) || [];
+  list.forEach((m) => {
+    if (m.senderId !== userId && m.status === "sent") {
+      m.status = "delivered";
+    }
+  });
+
+  broadcastAll("chat:delivered", { threadId, userId });
   res.json({ success: true });
 });
 
@@ -475,44 +585,65 @@ function registerSocketHandlers(socket) {
     socket.broadcast.emit("peer-joined", { sid: socket.id, ...data });
   });
 
-  // Relais des messages instantanés
+  // Relais des messages instantanés (diffusé à tous les clients connectés)
   socket.on("chat:message", (msg) => {
     if (msg) {
       if (!msg.id) msg.id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       if (!msg.timestamp) msg.timestamp = new Date().toISOString();
       saveMessage(msg);
     }
-    socket.broadcast.emit("chat:message", msg);
+    broadcastAll("chat:message", msg);
   });
 
   // Relais de la saisie en cours
   socket.on("chat:typing", (evt) => {
-    socket.broadcast.emit("chat:typing", evt);
+    broadcastAll("chat:typing", evt);
   });
 
   socket.on("chat:stop-typing", (evt) => {
-    socket.broadcast.emit("chat:stop-typing", evt);
+    broadcastAll("chat:stop-typing", evt);
   });
 
   // Relais des accusés de lecture / réception
   socket.on("chat:read", (evt) => {
-    socket.broadcast.emit("chat:read", evt);
+    if (evt?.threadId && evt?.userId) {
+      const list = messageStore.get(evt.threadId) || [];
+      list.forEach((m) => {
+        if (m.senderId !== evt.userId) m.status = "read";
+      });
+    }
+    broadcastAll("chat:read", evt);
   });
 
   socket.on("chat:delivered", (evt) => {
-    socket.broadcast.emit("chat:delivered", evt);
+    if (evt?.threadId && evt?.userId) {
+      const list = messageStore.get(evt.threadId) || [];
+      list.forEach((m) => {
+        if (m.senderId !== evt.userId && m.status === "sent") m.status = "delivered";
+      });
+    }
+    broadcastAll("chat:delivered", evt);
   });
 
   // Relais des réactions
   socket.on("chat:reaction", (evt) => {
-    socket.broadcast.emit("chat:reaction", evt);
+    if (evt?.messageId && evt?.reactions) {
+      for (const list of messageStore.values()) {
+        const m = list.find((item) => item.id === evt.messageId);
+        if (m) {
+          m.reactions = evt.reactions;
+          break;
+        }
+      }
+    }
+    broadcastAll("chat:reaction", evt);
   });
 
   // Signalisation d'appels / interphone WebRTC de secours
-  socket.on("offer", (data) => socket.broadcast.emit("offer", data));
-  socket.on("answer", (data) => socket.broadcast.emit("answer", data));
-  socket.on("ice-candidate", (data) => socket.broadcast.emit("ice-candidate", data));
-  socket.on("hangup", (data) => socket.broadcast.emit("hangup", data));
+  socket.on("offer", (data) => broadcastAll("offer", data));
+  socket.on("answer", (data) => broadcastAll("answer", data));
+  socket.on("ice-candidate", (data) => broadcastAll("ice-candidate", data));
+  socket.on("hangup", (data) => broadcastAll("hangup", data));
 
   socket.on("disconnect", () => {
     const user = onlineUsers.get(socket.id);
