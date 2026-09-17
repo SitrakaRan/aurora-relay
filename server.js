@@ -187,7 +187,44 @@ app.post("/api/chat/sync", (req, res) => {
     });
   }
 
-  res.json({ success: true, syncedThreads, syncedMessages });
+  const allCloudMessages = [];
+  for (const list of messageStore.values()) {
+    if (Array.isArray(list)) {
+      allCloudMessages.push(...list);
+    }
+  }
+
+  res.json({
+    success: true,
+    syncedThreads,
+    syncedMessages,
+    threads: Array.from(threadStore.values()),
+    messages: allCloudMessages,
+  });
+});
+
+app.get("/api/chat/sync", (_req, res) => {
+  const allCloudMessages = [];
+  for (const list of messageStore.values()) {
+    if (Array.isArray(list)) {
+      allCloudMessages.push(...list);
+    }
+  }
+  res.json({
+    success: true,
+    threads: Array.from(threadStore.values()),
+    messages: allCloudMessages,
+  });
+});
+
+app.get("/api/chat/messages", (_req, res) => {
+  const allCloudMessages = [];
+  for (const list of messageStore.values()) {
+    if (Array.isArray(list)) {
+      allCloudMessages.push(...list);
+    }
+  }
+  res.json({ success: true, messages: allCloudMessages });
 });
 
 // Création / mise à jour de thread avec détection stricte des conversations directes existantes
