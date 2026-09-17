@@ -13,7 +13,7 @@ app.use((_req, res, next) => {
   if (_req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "150mb" }));
 
 // 1. Protection : AUCUN site web, AUCUN dashboard public affiché
 app.get("/", (_req, res) => {
@@ -504,26 +504,55 @@ app.post("/api/chat/upload", (req, res) => {
   res.json({ success: true, url: `/api/chat/uploads/${id}`, id });
 });
 
+function serveBufferWithRange(req, res, buffer, mimeType) {
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Range, Content-Type, Accept");
+  res.setHeader("Content-Type", mimeType || "video/mp4");
+  res.setHeader("Cache-Control", "public, max-age=86400");
+
+  const total = buffer.length;
+  const range = req.headers.range;
+
+  if (!range) {
+    res.setHeader("Content-Length", total);
+    return res.status(200).end(buffer);
+  }
+
+  const parts = range.replace(/bytes=/, "").split("-");
+  const start = parseInt(parts[0], 10) || 0;
+  const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
+
+  if (start >= total || end >= total) {
+    res.setHeader("Content-Range", `bytes */${total}`);
+    return res.status(416).end();
+  }
+
+  const chunk = buffer.subarray(start, end + 1);
+  res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+  res.setHeader("Content-Length", chunk.length);
+  res.status(206).end(chunk);
+}
+
 app.get("/api/chat/uploads/:id", (req, res) => {
   const file = uploadStore.get(req.params.id);
   if (!file) return res.status(404).send("Fichier introuvable");
-  res.setHeader("Content-Type", file.mimeType);
-  if (file.data.startsWith("data:")) {
-    const base64Data = file.data.split(",")[1];
-    return res.send(Buffer.from(base64Data, "base64"));
+  let data = file.data;
+  if (data.startsWith("data:")) {
+    data = data.split(",")[1];
   }
-  res.send(Buffer.from(file.data, "base64"));
+  serveBufferWithRange(req, res, Buffer.from(data, "base64"), file.mimeType);
 });
 
 app.get("/chat-uploads/:filename", (req, res) => {
   const file = uploadStore.get(req.params.filename);
   if (!file) return res.status(404).send("Fichier introuvable");
-  res.setHeader("Content-Type", file.mimeType);
-  if (file.data.startsWith("data:")) {
-    const base64Data = file.data.split(",")[1];
-    return res.send(Buffer.from(base64Data, "base64"));
+  let data = file.data;
+  if (data.startsWith("data:")) {
+    data = data.split(",")[1];
   }
-  res.send(Buffer.from(file.data, "base64"));
+  serveBufferWithRange(req, res, Buffer.from(data, "base64"), file.mimeType);
 });
 
 // Tout autre chemin renvoie 404
