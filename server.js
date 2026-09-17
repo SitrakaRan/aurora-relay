@@ -511,6 +511,7 @@ const ioCall = new Server(server, {
 });
 
 const onlineUsers = new Map(); // socketId -> { userId, userName, role, avatarUrl }
+const callDevices = new Map(); // socketId -> { sid, name, role, userId, userName }
 
 // Fonction universelle d'émission vers tous les clients connectés
 function broadcastAll(event, data) {
@@ -539,6 +540,21 @@ function broadcastPresence() {
   broadcastAll("chat:presence", presencePayload);
 }
 
+// Fonction de diffusion de l'état des correspondants pour AuroraCall (WebRTC)
+function broadcastCallPresence() {
+  const devices = Array.from(callDevices.values());
+  const kioskCount = devices.filter((d) => d.role === "kiosk").length;
+  const guestCount = devices.filter((d) => d.role === "guest").length;
+  const presenceData = {
+    kiosk: kioskCount > 0,
+    guest: guestCount > 0,
+    kioskCount,
+    guestCount,
+    devices,
+  };
+  broadcastAll("presence", presenceData);
+}
+
 function registerSocketHandlers(socket) {
   // Envoyer immédiatement l'état actuel de présence dès la connexion
   const currentUsers = Array.from(onlineUsers.values());
@@ -546,6 +562,16 @@ function registerSocketHandlers(socket) {
     onlineUserIds: Array.from(new Set(currentUsers.map((u) => u.userId).filter(Boolean))),
     onlineUserNames: Array.from(new Set(currentUsers.map((u) => u.userName).filter(Boolean))),
     onlineUsers: currentUsers,
+  });
+
+  // Envoyer la présence d'appels à la connexion
+  const devs = Array.from(callDevices.values());
+  socket.emit("presence", {
+    kiosk: devs.some((d) => d.role === "kiosk"),
+    guest: devs.some((d) => d.role === "guest"),
+    kioskCount: devs.filter((d) => d.role === "kiosk").length,
+    guestCount: devs.filter((d) => d.role === "guest").length,
+    devices: devs,
   });
 
   // Identification utilisateur (compatible avec objet user ou data string)
@@ -574,14 +600,28 @@ function registerSocketHandlers(socket) {
 
   // Événement join (visio / interphone / identifiant utilisateur)
   socket.on("join", (data) => {
-    if (data?.userId) {
+    const role = data?.role || "guest";
+    const name = data?.name || "Appareil";
+    const userId = data?.userId || "";
+    const userName = data?.userName || name;
+
+    callDevices.set(socket.id, {
+      sid: socket.id,
+      name,
+      role,
+      userId,
+      userName,
+    });
+
+    if (userId) {
       onlineUsers.set(socket.id, {
-        userId: data.userId,
-        userName: data.name || "Appareil",
-        role: data.role || "kiosk",
+        userId,
+        userName,
+        role,
       });
       broadcastPresence();
     }
+    broadcastCallPresence();
     socket.broadcast.emit("peer-joined", { sid: socket.id, ...data });
   });
 
@@ -640,17 +680,47 @@ function registerSocketHandlers(socket) {
   });
 
   // Signalisation d'appels / interphone WebRTC de secours
-  socket.on("offer", (data) => broadcastAll("offer", data));
-  socket.on("answer", (data) => broadcastAll("answer", data));
-  socket.on("ice-candidate", (data) => broadcastAll("ice-candidate", data));
+  socket.on("offer", (data) => {
+    socket.broadcast.emit("offer", { ...data, fromSid: socket.id });
+    try { io.of("/call").except(socket.id).emit("offer", { ...data, fromSid: socket.id }); } catch {}
+    try { ioCall.except(socket.id).emit("offer", { ...data, fromSid: socket.id }); } catch {}
+    try { ioCall.of("/call").except(socket.id).emit("offer", { ...data, fromSid: socket.id }); } catch {}
+  });
+
+  socket.on("answer", (data) => {
+    socket.broadcast.emit("answer", { ...data, fromSid: socket.id });
+    try { io.of("/call").except(socket.id).emit("answer", { ...data, fromSid: socket.id }); } catch {}
+    try { ioCall.except(socket.id).emit("answer", { ...data, fromSid: socket.id }); } catch {}
+    try { ioCall.of("/call").except(socket.id).emit("answer", { ...data, fromSid: socket.id }); } catch {}
+  });
+
+  socket.on("ice", (data) => {
+    socket.broadcast.emit("ice", { ...data, fromSid: socket.id });
+    try { io.of("/call").except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
+    try { ioCall.except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
+    try { ioCall.of("/call").except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
+  });
+
+  socket.on("ice-candidate", (data) => {
+    socket.broadcast.emit("ice-candidate", { ...data, fromSid: socket.id });
+    socket.broadcast.emit("ice", { ...data, fromSid: socket.id });
+    try { io.of("/call").except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
+    try { ioCall.except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
+    try { ioCall.of("/call").except(socket.id).emit("ice", { ...data, fromSid: socket.id }); } catch {}
+  });
+
+  socket.on("call-taken", (data) => broadcastAll("call-taken", data));
+  socket.on("busy", (data) => broadcastAll("busy", data));
   socket.on("hangup", (data) => broadcastAll("hangup", data));
 
   socket.on("disconnect", () => {
     const user = onlineUsers.get(socket.id);
     onlineUsers.delete(socket.id);
+    callDevices.delete(socket.id);
     if (user) {
       broadcastPresence();
     }
+    broadcastCallPresence();
   });
 }
 
